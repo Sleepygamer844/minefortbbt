@@ -12,7 +12,7 @@ const CONFIG = {
   port: parseInt(process.env.MC_PORT) || 25565,
   username: process.env.MC_USERNAME || 'tpstoohigh',
   password: process.env.MC_PASSWORD,
-  version: process.env.MC_VERSION || false,
+  version: (process.env.MC_VERSION && process.env.MC_VERSION !== 'false') ? process.env.MC_VERSION : undefined,
   discordWebhook: process.env.DISCORD_WEBHOOK || '',
   discordBotToken: process.env.DISCORD_BOT_TOKEN || '',
   discordChannelId: process.env.DISCORD_CHANNEL_ID || ''
