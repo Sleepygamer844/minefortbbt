@@ -49,11 +49,22 @@ function paletteColor(id) {
   ]
 }
 
+// ─── HTTP SERVER FIRST (so Render port scan succeeds immediately) ───
 const app = express()
 const PORT = process.env.PORT || 3000
-app.get('/', (req, res) => res.json({ status: 'ok' }))
-app.listen(PORT, () => console.log(`[HTTP] Listening on ${PORT}`))
+let botStatus = 'starting'
 
+app.get('/', (req, res) => {
+  res.json({ status: botStatus, bot: CONFIG.username, uptime: Math.floor(process.uptime()) + 's' })
+})
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[HTTP] Listening on ${PORT}`)
+  // Only start the bot AFTER HTTP is up
+  setTimeout(createBot, 500)
+})
+
+// ─── DISCORD HELPERS ───
 async function sendDiscordText(message) {
   if (!CONFIG.discordWebhook) return
   try {
@@ -68,7 +79,7 @@ async function sendDiscordImage(imagePath, caption) {
     form.append('content', caption || '')
     form.append('file', fs.createReadStream(imagePath), { filename: path.basename(imagePath) })
     await axios.post(CONFIG.discordWebhook, form, { headers: form.getHeaders() })
-    console.log('[DISCORD] Sent:', imagePath)
+    console.log('[DISCORD] Sent image:', path.basename(imagePath))
   } catch (err) { console.error('[DISCORD] Image failed:', err.message) }
 }
 
@@ -89,21 +100,24 @@ async function fetchCaptchaAnswer() {
         return ans
       }
     }
-  } catch (err) { console.error('[DISCORD]', err.message) }
+  } catch (err) { console.error('[DISCORD] Poll failed:', err.message) }
   return null
 }
 
-// Global map storage — persists across scans
-const capturedMaps = new Map()
+// ─── GLOBAL STATE ───
+let currentBot = null
+let capturedMaps = {}
 let captchaSent = false
 let pollingActive = false
 
+// ─── CREATE BOT ───
 function createBot() {
-  console.log('[BOT] Connecting...')
+  botStatus = 'connecting'
   captchaSent = false
   pollingActive = false
-  capturedMaps.clear()
+  capturedMaps = {}
 
+  console.log('[BOT] Connecting...')
   const bot = mineflayer.createBot({
     host: CONFIG.host,
     port: CONFIG.port,
@@ -111,8 +125,9 @@ function createBot() {
     version: CONFIG.version,
     auth: 'offline'
   })
+  currentBot = bot
 
-  // ─── MAP PACKET LISTENER ───
+  // ─── MAP HANDLER ───
   const mapHandler = (packet) => {
     try {
       const id = packet.itemDamage !== undefined ? packet.itemDamage : packet.mapId
@@ -135,15 +150,15 @@ function createBot() {
       }
       const file = path.join(MAP_DIR, `map_${id}.png`)
       fs.writeFileSync(file, PNG.sync.write(png))
-      capturedMaps.set(id, file)
-      console.log(`[MAP] Saved map_${id}.png (total: ${capturedMaps.size})`)
+      capturedMaps[id] = file
+      console.log(`[MAP] Saved (total captured: ${Object.keys(capturedMaps).length})`)
     } catch (e) { console.error('[MAP] Render fail:', e.message) }
   }
 
-  ;['map', 'map_data'].forEach(name => {
-    try { bot._client.on(name, mapHandler) } catch (e) {}
-  })
+  try { bot._client.on('map', mapHandler) } catch (e) {}
+  try { bot._client.on('map_data', mapHandler) } catch (e) {}
 
+  // ─── CHAT HANDLER ───
   bot.on('message', (msg) => {
     const text = msg.toString()
     console.log(`[CHAT] ${text}`)
@@ -152,16 +167,17 @@ function createBot() {
       bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     } else if (/\/login/i.test(text)) {
       bot.chat(`/login ${CONFIG.password}`)
-    } else if (/captcha/i.test(text)) {
-      sendDiscordText(`🔐 CAPTCHA prompt detected — waiting for map data...`)
-      // Give the server 3 seconds to send maps, then flush whatever we have
+    } else if (/captcha/i.test(text) && !captchaSent) {
+      sendDiscordText(`🔐 CAPTCHA prompt detected. Waiting 3s for map data...`)
       setTimeout(() => flushMaps(), 3000)
     }
   })
 
   bot.on('login', () => {
     console.log(`[BOT] Logged in as ${bot.username}`)
+    botStatus = 'online'
     sendDiscordText(`✅ Bot **${bot.username}** joined`)
+
     setInterval(() => {
       if (bot.entity) {
         bot.setControlState('jump', true)
@@ -173,43 +189,53 @@ function createBot() {
   bot.on('kicked', (reason) => {
     const r = typeof reason === 'string' ? reason : JSON.stringify(reason)
     console.log(`[BOT] Kicked: ${r}`)
+    botStatus = 'kicked'
     sendDiscordText(`❌ Kicked: ${r}`)
     setTimeout(createBot, 15000)
   })
 
   bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
-  bot.on('end', () => { setTimeout(createBot, 15000) })
+
+  bot.on('end', (reason) => {
+    console.log(`[BOT] Disconnected: ${reason}`)
+    botStatus = 'disconnected'
+    setTimeout(createBot, 15000)
+  })
 }
 
-// ─── SEND ALL CAPTURED MAPS TO DISCORD ───
+// ─── FLUSH MAPS TO DISCORD ───
 async function flushMaps() {
-  if (captchaSent) {
-    console.log('[CAPTCHA] Already sent, skipping')
-    return
-  }
+  if (captchaSent) return
 
-  if (capturedMaps.size === 0) {
-    console.log('[CAPTCHA] No maps captured yet, waiting more...')
-    // Wait a bit longer
+  const count = Object.keys(capturedMaps).length
+  if (count === 0) {
+    console.log('[CAPTCHA] No maps yet — waiting 3 more seconds')
     await new Promise(r => setTimeout(r, 3000))
   }
 
-  if (capturedMaps.size === 0) {
+  const finalCount = Object.keys(capturedMaps).length
+  if (finalCount === 0) {
     await sendDiscordText('⚠️ No map data received from server')
     return
   }
 
   captchaSent = true
-  console.log(`[CAPTCHA] Sending ${capturedMaps.size} maps to Discord`)
+  console.log(`[CAPTCHA] Sending ${finalCount} maps to Discord`)
 
-  // Sort by map ID descending (highest first) so they appear in a sensible order
-  const sorted = [...capturedMaps.entries()].sort((a, b) => b[0] - a[0])
+  // Sort by map ID ascending (oldest/lowest first = usually top-left of grid)
+  const ids = Object.keys(capturedMaps).map(Number).sort((a, b) => a - b)
 
-  for (const [id, file] of sorted) {
-    await sendDiscordImage(file, `Map ID ${id}`)
+  for (const id of ids) {
+    await sendDiscordImage(capturedMaps[id], `Map ${id}`)
   }
 
-  await sendDiscordText(`🔐 **${capturedMaps.size} CAPTCHA maps sent above.**\nRead them and reply in this channel with:\n\`!captcha <answer>\`\n(Example: \`!captcha UqUt\`)\nYou have 5 minutes.`)
+  await sendDiscordText(
+    `🔐 **${finalCount} CAPTCHA maps sent above.**\n` +
+    `Read them and reply:\n` +
+    `\`!captcha <answer>\`\n` +
+    `Example: \`!captcha UqUt\`\n` +
+    `You have 5 minutes.`
+  )
 
   startPolling()
 }
@@ -225,103 +251,16 @@ async function startPolling() {
     const ans = await fetchCaptchaAnswer()
     if (ans) {
       console.log(`[CAPTCHA] Got answer: ${ans}`)
-      // Find the current bot — we can't reference it here, so use global
-      if (global._currentBot) {
-        global._currentBot.chat(ans)
-        sendDiscordText(`✅ Sent answer to Minecraft: **${ans}**`)
+      if (currentBot) {
+        currentBot.chat(ans)
+        sendDiscordText(`✅ Sent to Minecraft: **${ans}**`)
       }
       pollingActive = false
       return
     }
   }
-  sendDiscordText('⏰ CAPTCHA timed out (5 min)')
+  sendDiscordText('⏰ CAPTCHA timed out (5 minutes)')
   pollingActive = false
 }
 
-// Store the bot globally so polling can access it
-const originalCreateBot = createBot
-createBot = function() {
-  console.log('[BOT] Connecting...')
-  captchaSent = false
-  pollingActive = false
-  capturedMaps.clear()
-
-  const bot = mineflayer.createBot({
-    host: CONFIG.host,
-    port: CONFIG.port,
-    username: CONFIG.username,
-    version: CONFIG.version,
-    auth: 'offline'
-  })
-
-  global._currentBot = bot
-
-  const mapHandler = (packet) => {
-    try {
-      const id = packet.itemDamage !== undefined ? packet.itemDamage : packet.mapId
-      const width = packet.columns || 128
-      const height = packet.rows || 128
-      const data = packet.data
-      console.log(`[MAP] Received map ${id} (${width}x${height})`)
-      if (!data || data.length < width * height) return
-
-      const png = new PNG({ width, height })
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const [r, g, b, a] = paletteColor(data[x + y * width])
-          const p = (y * width + x) * 4
-          png.data[p] = r
-          png.data[p + 1] = g
-          png.data[p + 2] = b
-          png.data[p + 3] = a
-        }
-      }
-      const file = path.join(MAP_DIR, `map_${id}.png`)
-      fs.writeFileSync(file, PNG.sync.write(png))
-      capturedMaps.set(id, file)
-      console.log(`[MAP] Saved map_${id}.png (total: ${capturedMaps.size})`)
-    } catch (e) { console.error('[MAP] Render fail:', e.message) }
-  }
-
-  ;['map', 'map_data'].forEach(name => {
-    try { bot._client.on(name, mapHandler) } catch (e) {}
-  })
-
-  bot.on('message', (msg) => {
-    const text = msg.toString()
-    console.log(`[CHAT] ${text}`)
-
-    if (/\/register/i.test(text)) {
-      bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
-    } else if (/\/login/i.test(text)) {
-      bot.chat(`/login ${CONFIG.password}`)
-    } else if (/captcha/i.test(text)) {
-      sendDiscordText(`🔐 CAPTCHA prompt detected — waiting for map data...`)
-      setTimeout(() => flushMaps(), 3000)
-    }
-  })
-
-  bot.on('login', () => {
-    console.log(`[BOT] Logged in as ${bot.username}`)
-    sendDiscordText(`✅ Bot **${bot.username}** joined`)
-    setInterval(() => {
-      if (bot.entity) {
-        bot.setControlState('jump', true)
-        setTimeout(() => bot.setControlState('jump', false), 400)
-      }
-    }, 30000)
-  })
-
-  bot.on('kicked', (reason) => {
-    const r = typeof reason === 'string' ? reason : JSON.stringify(reason)
-    console.log(`[BOT] Kicked: ${r}`)
-    sendDiscordText(`❌ Kicked: ${r}`)
-    setTimeout(createBot, 15000)
-  })
-
-  bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
-  bot.on('end', () => { setTimeout(createBot, 15000) })
-}
-
-console.log('═══ MINEFORT BOT — MAP CAPTURE v3 ═══')
-createBot()
+console.log('═══ MINEFORT BOT — FINAL ═══')
