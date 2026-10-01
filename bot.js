@@ -12,6 +12,7 @@ const CONFIG = {
   username: process.env.MC_USERNAME || 'tpstoohigh',
   password: process.env.MC_PASSWORD,
   version: (process.env.MC_VERSION && process.env.MC_VERSION !== 'false') ? process.env.MC_VERSION : undefined,
+  geminiApiKey: process.env.GEMINI_API_KEY || '',
   discordWebhook: process.env.DISCORD_WEBHOOK || '',
   discordBotToken: process.env.DISCORD_BOT_TOKEN || '',
   discordChannelId: process.env.DISCORD_CHANNEL_ID || ''
@@ -52,6 +53,12 @@ app.listen(PORT, '0.0.0.0', () => {
   setTimeout(createBot, 500)
 })
 
+async function sendDiscordText(message) {
+  if (!CONFIG.discordWebhook) return
+  try { await axios.post(CONFIG.discordWebhook, { content: String(message).substring(0, 1900) }) }
+  catch (err) { console.error('[DISCORD]', err.message) }
+}
+
 async function sendDiscordImage(imagePath, caption) {
   if (!CONFIG.discordWebhook) return
   try {
@@ -63,17 +70,10 @@ async function sendDiscordImage(imagePath, caption) {
       maxBodyLength: Infinity,
       timeout: 5000
     })
-    console.log('[DISCORD] Image sent')
-  } catch (err) { console.error('[DISCORD] Failed:', err.message) }
+  } catch (err) { console.error('[DISCORD]', err.message) }
 }
 
-async function sendDiscordText(message) {
-  if (!CONFIG.discordWebhook) return
-  try { await axios.post(CONFIG.discordWebhook, { content: String(message).substring(0, 1900) }) }
-  catch (err) { console.error('[DISCORD]', err.message) }
-}
-
-async function fetchCaptchaAnswer() {
+async function fetchManualAnswer() {
   if (!CONFIG.discordBotToken || !CONFIG.discordChannelId) return null
   try {
     const res = await axios.get(
@@ -90,13 +90,65 @@ async function fetchCaptchaAnswer() {
         return ans
       }
     }
-  } catch (err) { /* silent on poll errors */ }
+  } catch (err) {}
   return null
+}
+
+// ─── GEMINI VISION API ───
+async function askGemini(imagePath) {
+  if (!CONFIG.geminiApiKey) {
+    console.log('[GEMINI] No API key set')
+    return null
+  }
+
+  try {
+    const imageBuffer = fs.readFileSync(imagePath)
+    const base64Image = imageBuffer.toString('base64')
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${CONFIG.geminiApiKey}`
+
+    const body = {
+      contents: [{
+        parts: [
+          { text: 'This is a CAPTCHA from a Minecraft server. It shows letters in a grid. Read them left-to-right, top-to-bottom. Reply with ONLY the letters/numbers, nothing else. No explanation, no punctuation, just the characters.' },
+          { inline_data: { mime_type: 'image/png', data: base64Image } }
+        ]
+      }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 20
+      }
+    }
+
+    const t0 = Date.now()
+    const res = await axios.post(url, body, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    })
+    const elapsed = Date.now() - t0
+    console.log(`[GEMINI] Response in ${elapsed}ms`)
+
+    const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+    console.log(`[GEMINI] Raw: "${text}"`)
+
+    const cleaned = text.replace(/[^A-Za-z0-9]/g, '')
+    if (cleaned.length >= 3 && cleaned.length <= 8) {
+      return cleaned
+    }
+    console.log(`[GEMINI] Cleaned too short/long: "${cleaned}"`)
+    return null
+  } catch (err) {
+    console.error('[GEMINI] Error:', err.message)
+    if (err.response) {
+      console.error('[GEMINI] Response:', JSON.stringify(err.response.data).substring(0, 500))
+    }
+    return null
+  }
 }
 
 let currentBot = null
 let capturedMaps = {}
-let imageSent = false
+let handled = false
 let pollActive = false
 let reconnectDelay = 30000
 
@@ -145,8 +197,8 @@ function stitchByWorldOrder(bot) {
   if (frames.length !== 9) return null
 
   frames.sort((a, b) => {
-    if (a.y !== b.y) return b.y - a.y  // top row first
-    return a.z - b.z                    // left→right
+    if (a.y !== b.y) return b.y - a.y
+    return a.z - b.z
   })
 
   const TILE = 128
@@ -174,8 +226,44 @@ function stitchByWorldOrder(bot) {
   return out
 }
 
+async function handleCaptcha(bot) {
+  if (handled) return
+  handled = true
+
+  console.log('[CAPTCHA] Handling...')
+
+  // Stitch
+  const stitched = stitchByWorldOrder(bot)
+  if (!stitched) {
+    console.log('[CAPTCHA] Stitch failed')
+    sendDiscordText('⚠️ Could not stitch maps')
+    return
+  }
+
+  // Send to Discord as backup
+  await sendDiscordImage(stitched, '🤖 **AI is reading this — Discord reply is backup only**')
+
+  // Start manual poll in parallel (in case AI fails)
+  startFastPoll()
+
+  // Ask Gemini
+  const aiAnswer = await askGemini(stitched)
+
+  if (aiAnswer && !pollActive) {
+    console.log(`[CAPTCHA] ✅ AI answer: ${aiAnswer}`)
+    bot.chat(aiAnswer)
+    sendDiscordText(`🤖 **AI submitted: \`${aiAnswer}\`**`)
+  } else if (aiAnswer) {
+    // Manual was already done, ignore
+    console.log(`[CAPTCHA] Manual already submitted`)
+  } else {
+    console.log('[CAPTCHA] ⚠️ AI failed — waiting for manual Discord reply')
+    sendDiscordText('⚠️ **AI could not read it.** Please reply `!captcha <code>` FAST!')
+  }
+}
+
 function createBot() {
-  imageSent = false
+  handled = false
   pollActive = false
   capturedMaps = {}
 
@@ -210,35 +298,9 @@ function createBot() {
       capturedMaps[id] = file
       console.log(`[MAP] ${Object.keys(capturedMaps).length}/9`)
 
-      // ─── SEND IMAGE IMMEDIATELY WHEN 9 MAPS IN ───
-      if (Object.keys(capturedMaps).length === 9 && !imageSent) {
-        imageSent = true
-        console.log('[CAPTCHA] 9 maps ready — sending image NOW')
-
-        // Small delay so frames are all registered as entities
-        setTimeout(async () => {
-          const stitched = stitchByWorldOrder(bot)
-          if (stitched) {
-            await sendDiscordImage(
-              stitched,
-              '🔐 **CAPTCHA** — reply `!captcha <code>` **NOW**\n' +
-              'Read left→right, top→bottom'
-            )
-          } else {
-            // Frames not yet registered — retry once
-            setTimeout(async () => {
-              const retry = stitchByWorldOrder(bot)
-              if (retry) {
-                await sendDiscordImage(retry, '🔐 **CAPTCHA** — reply `!captcha <code>` **NOW**')
-              } else {
-                sendDiscordText('⚠️ Could not stitch — frames missing')
-              }
-            }, 800)
-          }
-        }, 300)
-
-        // START POLLING IMMEDIATELY
-        startFastPoll()
+      if (Object.keys(capturedMaps).length === 9 && !handled) {
+        // Give frames 300ms to register as entities
+        setTimeout(() => handleCaptcha(bot), 300)
       }
     } catch (e) { console.error('[MAP]', e.message) }
   }
@@ -246,31 +308,22 @@ function createBot() {
   try { bot._client.on('map', mapHandler) } catch (e) {}
   try { bot._client.on('map_data', mapHandler) } catch (e) {}
 
-  bot.on('message', async (msg) => {
+  bot.on('message', (msg) => {
     const text = msg.toString()
     console.log(`[CHAT] ${text}`)
 
     if (/\/register/i.test(text)) bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     else if (/\/login/i.test(text)) bot.chat(`/login ${CONFIG.password}`)
-    else if (/enter the captcha/i.test(text)) {
-      console.log('[CAPTCHA] Prompt received')
-      // If poll not started (maps came late), start now
-      if (!pollActive) startFastPoll()
-      // If image not sent (unlikely), try now
-      if (!imageSent) {
-        imageSent = true
-        setTimeout(async () => {
-          const s = stitchByWorldOrder(bot)
-          if (s) await sendDiscordImage(s, '🔐 **CAPTCHA** — reply `!captcha <code>` **NOW**')
-        }, 200)
-      }
+    else if (/enter the captcha/i.test(text) && !handled) {
+      console.log('[CAPTCHA] Prompt detected')
+      setTimeout(() => handleCaptcha(bot), 100)
     }
   })
 
   bot.on('login', () => {
     console.log(`[BOT] ✅ Logged in`)
     reconnectDelay = 30000
-    sendDiscordText(`✅ Bot **${bot.username}** connected`)
+    sendDiscordText(`✅ Bot connected`)
 
     setInterval(() => {
       if (bot.entity) {
@@ -300,25 +353,24 @@ function createBot() {
   })
 }
 
-// ─── FAST POLL: 250ms (even faster) ───
 async function startFastPoll() {
   if (pollActive) return
   pollActive = true
-  console.log('[CAPTCHA] Fast-poll active (250ms)')
+  console.log('[CAPTCHA] Manual poll active')
 
-  for (let i = 0; i < 80; i++) { // 20 seconds max
-    const ans = await fetchCaptchaAnswer()
+  for (let i = 0; i < 80; i++) {
+    const ans = await fetchManualAnswer()
     if (ans) {
-      console.log(`[CAPTCHA] Got: ${ans}`)
+      console.log(`[CAPTCHA] Manual: ${ans}`)
       if (currentBot) currentBot.chat(ans)
-      sendDiscordText(`✅ Sent: **${ans}**`)
+      sendDiscordText(`👤 **You submitted: \`${ans}\`**`)
       pollActive = false
       return
     }
     await new Promise(r => setTimeout(r, 250))
   }
-  sendDiscordText('⏰ Poll timed out')
   pollActive = false
 }
 
-console.log('═══ MINEFORT BOT — v7 (fast-send) ═══')
+console.log('═══ MINEFORT BOT — v8 (AI-powered) ═══')
+console.log(`Gemini API key: ${CONFIG.geminiApiKey ? '✅ set' : '❌ missing'}`)
