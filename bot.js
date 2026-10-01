@@ -134,7 +134,8 @@ async function askGemini(imagePath) {
 
 let currentBot = null
 let capturedMaps = {}
-let handled = false
+let submitted = false
+let handling = false
 let pollActive = false
 let reconnectDelay = 30000
 
@@ -178,13 +179,11 @@ function collectFrames(bot) {
   return out
 }
 
-// ─── STITCH HELPERS ───
 function stitchFiles(files, outName) {
   const TILE = 128
   const SIZE = TILE * 3
   const stitched = new PNG({ width: SIZE, height: SIZE })
 
-  // Initialize to white
   for (let i = 0; i < stitched.data.length; i += 4) {
     stitched.data[i] = 255
     stitched.data[i+1] = 255
@@ -207,9 +206,7 @@ function stitchFiles(files, outName) {
           stitched.data[dp+3] = src.data[sp+3]
         }
       }
-    } catch (e) {
-      console.error(`[STITCH] Tile ${i} failed:`, e.message)
-    }
+    } catch (e) { console.error(`[STITCH] Tile ${i}:`, e.message) }
   }
 
   const out = path.join(MAP_DIR, outName)
@@ -217,59 +214,66 @@ function stitchFiles(files, outName) {
   return out
 }
 
-function stitchByPosition(bot) {
+// ─── WAIT FOR 9 FRAMES WITH POSITIONS, THEN STITCH ───
+async function waitAndStitch(bot, maxWaitMs = 5000) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < maxWaitMs) {
+    const frames = collectFrames(bot)
+    const mapCount = Object.keys(capturedMaps).length
+
+    if (mapCount >= 9 && frames.length >= 9) {
+      // We have everything — stitch
+      frames.sort((a, b) => {
+        if (a.y !== b.y) return b.y - a.y   // top row first
+        return a.z - b.z                     // left → right
+      })
+      const file = stitchFiles(frames.map(f => f.file), 'stitched_pos.png')
+      return { file, count: frames.length }
+    }
+
+    await new Promise(r => setTimeout(r, 200))
+  }
+
+  // Timeout — return whatever we have
   const frames = collectFrames(bot)
-  if (frames.length === 0) return null
+  const mapCount = Object.keys(capturedMaps).length
+  console.log(`[STITCH] Timeout: ${mapCount} maps, ${frames.length} frames`)
 
-  frames.sort((a, b) => {
-    if (a.y !== b.y) return b.y - a.y
-    return a.z - b.z
-  })
+  if (frames.length > 0) {
+    frames.sort((a, b) => {
+      if (a.y !== b.y) return b.y - a.y
+      return a.z - b.z
+    })
+    const file = stitchFiles(frames.map(f => f.file), 'stitched_pos.png')
+    return { file, count: frames.length }
+  }
 
-  return stitchFiles(frames.map(f => f.file), 'stitched_pos.png')
-}
-
-function stitchByIdOrder() {
-  const ids = Object.keys(capturedMaps).map(Number).sort((a, b) => a - b)
-  if (ids.length === 0) return null
-  return stitchFiles(ids.map(id => capturedMaps[id]), 'stitched_id.png')
+  return null
 }
 
 async function handleCaptcha(bot) {
-  if (handled) return
-  handled = true
+  if (submitted || handling) return
+  handling = true
 
-  const mapCount = Object.keys(capturedMaps).length
-  console.log(`[CAPTCHA] Handling with ${mapCount} maps`)
+  console.log(`[CAPTCHA] Handler started (have ${Object.keys(capturedMaps).length} maps)`)
 
-  // Try position-based stitch
-  let stitched = null
-  let method = 'none'
+  const result = await waitAndStitch(bot, 5000)
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    stitched = stitchByPosition(bot)
-    if (stitched) { method = 'position'; break }
-    await new Promise(r => setTimeout(r, 300))
-  }
-
-  if (!stitched) {
-    console.log(`[CAPTCHA] Position failed (${mapCount} maps) — trying ID order`)
-    stitched = stitchByIdOrder()
-    method = 'id'
-  }
-
-  if (!stitched) {
-    console.log('[CAPTCHA] ❌ Both stitch methods failed')
-    sendDiscordText(`⚠️ Could not stitch (only ${mapCount} maps)`)
+  if (!result) {
+    console.log('[CAPTCHA] ❌ No frames with positions — cannot stitch cleanly')
+    sendDiscordText('⚠️ Could not read item frame positions — no image sent')
+    handling = false
     return
   }
 
-  console.log(`[CAPTCHA] ✅ Stitched via ${method} — sending`)
+  console.log(`[CAPTCHA] ✅ Stitched with ${result.count} frames`)
 
-  await sendDiscordImage(stitched, `🤖 **AI reading (${method} order)** — Discord reply is backup`)
+  submitted = true
+
+  await sendDiscordImage(result.file, `🤖 **AI reading (${result.count}/9 frames)** — reply \`!captcha <code>\` as backup`)
   startFastPoll()
 
-  const aiAnswer = await askGemini(stitched)
+  const aiAnswer = await askGemini(result.file)
 
   if (aiAnswer && !pollActive) {
     console.log(`[CAPTCHA] ✅ AI: ${aiAnswer}`)
@@ -279,10 +283,13 @@ async function handleCaptcha(bot) {
     console.log('[CAPTCHA] ⚠️ AI failed — manual backup')
     sendDiscordText('⚠️ **AI failed — reply `!captcha <code>` FAST!**')
   }
+
+  handling = false
 }
 
 function createBot() {
-  handled = false
+  submitted = false
+  handling = false
   pollActive = false
   capturedMaps = {}
 
@@ -315,13 +322,7 @@ function createBot() {
       const file = path.join(MAP_DIR, `map_${id}.png`)
       fs.writeFileSync(file, PNG.sync.write(png))
       capturedMaps[id] = file
-      console.log(`[MAP] ${Object.keys(capturedMaps).length}/9 (id=${id})`)
-
-      // Trigger once we hit 9 OR more
-      if (Object.keys(capturedMaps).length >= 9 && !handled) {
-        console.log(`[CAPTCHA] Got ${Object.keys(capturedMaps).length} maps — triggering handler`)
-        setTimeout(() => handleCaptcha(bot), 500)
-      }
+      console.log(`[MAP] ${Object.keys(capturedMaps).length}/9`)
     } catch (e) { console.error('[MAP]', e.message) }
   }
 
@@ -334,9 +335,9 @@ function createBot() {
 
     if (/\/register/i.test(text)) bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     else if (/\/login/i.test(text)) bot.chat(`/login ${CONFIG.password}`)
-    else if (/enter the captcha/i.test(text) && !handled) {
-      console.log('[CAPTCHA] Chat prompt — triggering')
-      setTimeout(() => handleCaptcha(bot), 200)
+    else if (/enter the captcha/i.test(text) && !submitted && !handling) {
+      console.log('[CAPTCHA] Chat prompt — starting handler')
+      handleCaptcha(bot)
     }
   })
 
@@ -384,5 +385,5 @@ async function startFastPoll() {
   pollActive = false
 }
 
-console.log('═══ MINEFORT BOT — v10 (robust stitch) ═══')
+console.log('═══ MINEFORT BOT — v12 (position-only stitch) ═══')
 console.log(`Gemini: ${CONFIG.geminiApiKey ? '✅' : '❌'}`)
