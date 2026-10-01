@@ -16,7 +16,7 @@ const CONFIG = {
   host: process.env.MC_HOST || 'sleepyempiregen.minefort.com',
   port: parseInt(process.env.MC_PORT) || 25565,
   username: process.env.MC_USERNAME || 'tpstoohigh',
-  password: process.env.MC_PASSWORD || 'CHANGE_ME',
+  password: process.env.MC_PASSWORD || 'Tpsisnttoomuch',
   version: process.env.MC_VERSION || '26.1',
   discordWebhook: process.env.DISCORD_WEBHOOK || '',
   discordBotToken: process.env.DISCORD_BOT_TOKEN || '',
