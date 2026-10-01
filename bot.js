@@ -5,6 +5,7 @@ const fs = require('fs')
 const path = require('path')
 const FormData = require('form-data')
 const { PNG } = require('pngjs')
+const Tesseract = require('tesseract.js')
 
 const CONFIG = {
   host: process.env.MC_HOST || 'sleepyempiregen.minefort.com',
@@ -49,7 +50,7 @@ function paletteColor(id) {
   ]
 }
 
-// ─── HTTP SERVER FIRST (so Render port scan succeeds immediately) ───
+// ─── HTTP SERVER FIRST ───
 const app = express()
 const PORT = process.env.PORT || 3000
 let botStatus = 'starting'
@@ -60,8 +61,7 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[HTTP] Listening on ${PORT}`)
-  // Only start the bot AFTER HTTP is up
-  setTimeout(createBot, 500)
+  setTimeout(createBot, 1000)
 })
 
 // ─── DISCORD HELPERS ───
@@ -83,11 +83,11 @@ async function sendDiscordImage(imagePath, caption) {
   } catch (err) { console.error('[DISCORD] Image failed:', err.message) }
 }
 
-async function fetchCaptchaAnswer() {
+async function fetchManualAnswer() {
   if (!CONFIG.discordBotToken || !CONFIG.discordChannelId) return null
   try {
     const res = await axios.get(
-      `https://discord.com/api/v10/channels/${CONFIG.discordChannelId}/messages?limit=10`,
+      `https://discord.com/api/v10/channels/${CONFIG.discordChannelId}/messages?limit=5`,
       { headers: { Authorization: `Bot ${CONFIG.discordBotToken}` } }
     )
     for (const msg of res.data) {
@@ -100,24 +100,100 @@ async function fetchCaptchaAnswer() {
         return ans
       }
     }
-  } catch (err) { console.error('[DISCORD] Poll failed:', err.message) }
+  } catch (err) { console.error('[DISCORD]', err.message) }
   return null
 }
 
-// ─── GLOBAL STATE ───
+// ─── STATE ───
 let currentBot = null
 let capturedMaps = {}
-let captchaSent = false
-let pollingActive = false
+let captchaSubmitted = false
+let ocrRunning = false
+let ocrAnswer = null
+let ocrDone = false
+let manualPolling = false
+let reconnectDelay = 30000
+const MAX_RECONNECT = 300000
+
+// ─── STITCH 9 MAPS ───
+function stitchMaps() {
+  const ids = Object.keys(capturedMaps).map(Number).sort((a, b) => a - b)
+  if (ids.length < 9) return null
+
+  const TILE = 128
+  const SIZE = TILE * 3
+  const stitched = new PNG({ width: SIZE, height: SIZE })
+
+  for (let i = 0; i < 9; i++) {
+    const src = PNG.sync.read(fs.readFileSync(capturedMaps[ids[i]]))
+    const col = i % 3
+    const row = Math.floor(i / 3)
+    for (let y = 0; y < TILE; y++) {
+      for (let x = 0; x < TILE; x++) {
+        const sp = (y * TILE + x) * 4
+        const dp = ((row * TILE + y) * SIZE + (col * TILE + x)) * 4
+        stitched.data[dp] = src.data[sp]
+        stitched.data[dp + 1] = src.data[sp + 1]
+        stitched.data[dp + 2] = src.data[sp + 2]
+        stitched.data[dp + 3] = src.data[sp + 3]
+      }
+    }
+  }
+
+  const out = path.join(MAP_DIR, 'stitched.png')
+  fs.writeFileSync(out, PNG.sync.write(stitched))
+  return out
+}
+
+// ─── RUN OCR ───
+async function runOCR() {
+  if (ocrRunning || ocrDone) return
+  ocrRunning = true
+
+  const img = stitchMaps()
+  if (!img) {
+    console.log('[OCR] Not enough maps to stitch')
+    ocrRunning = false
+    return
+  }
+
+  await sendDiscordImage(img, '🧩 Stitched CAPTCHA (bot view)')
+
+  try {
+    console.log('[OCR] Running Tesseract...')
+    const { data } = await Tesseract.recognize(img, 'eng', {
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
+      tessedit_pageseg_mode: '7'
+    })
+    const raw = data.text.replace(/\s+/g, '')
+    const cleaned = raw.replace(/[^A-Za-z0-9]/g, '')
+    console.log(`[OCR] Raw: "${raw}" Cleaned: "${cleaned}" Conf: ${Math.round(data.confidence)}`)
+
+    if (cleaned.length >= 3 && cleaned.length <= 8) {
+      ocrAnswer = cleaned
+      await sendDiscordText(`🤖 OCR guess: \`${cleaned}\` (${Math.round(data.confidence)}% conf)`)
+    } else {
+      await sendDiscordText(`⚠️ OCR unclear: \`${cleaned}\` (${Math.round(data.confidence)}% conf)`)
+    }
+  } catch (e) {
+    console.error('[OCR]', e.message)
+    await sendDiscordText(`⚠️ OCR failed: ${e.message}`)
+  }
+
+  ocrDone = true
+  ocrRunning = false
+}
 
 // ─── CREATE BOT ───
 function createBot() {
   botStatus = 'connecting'
-  captchaSent = false
-  pollingActive = false
+  captchaSubmitted = false
   capturedMaps = {}
+  ocrAnswer = null
+  ocrDone = false
+  ocrRunning = false
 
-  console.log('[BOT] Connecting...')
+  console.log(`[BOT] Connecting... (prev delay ${reconnectDelay/1000}s)`)
   const bot = mineflayer.createBot({
     host: CONFIG.host,
     port: CONFIG.port,
@@ -127,14 +203,12 @@ function createBot() {
   })
   currentBot = bot
 
-  // ─── MAP HANDLER ───
   const mapHandler = (packet) => {
     try {
       const id = packet.itemDamage !== undefined ? packet.itemDamage : packet.mapId
       const width = packet.columns || 128
       const height = packet.rows || 128
       const data = packet.data
-      console.log(`[MAP] Received map ${id} (${width}x${height})`)
       if (!data || data.length < width * height) return
 
       const png = new PNG({ width, height })
@@ -142,24 +216,25 @@ function createBot() {
         for (let x = 0; x < width; x++) {
           const [r, g, b, a] = paletteColor(data[x + y * width])
           const p = (y * width + x) * 4
-          png.data[p] = r
-          png.data[p + 1] = g
-          png.data[p + 2] = b
-          png.data[p + 3] = a
+          png.data[p] = r; png.data[p+1] = g; png.data[p+2] = b; png.data[p+3] = a
         }
       }
       const file = path.join(MAP_DIR, `map_${id}.png`)
       fs.writeFileSync(file, PNG.sync.write(png))
       capturedMaps[id] = file
-      console.log(`[MAP] Saved (total captured: ${Object.keys(capturedMaps).length})`)
-    } catch (e) { console.error('[MAP] Render fail:', e.message) }
+      console.log(`[MAP] Captured ${Object.keys(capturedMaps).length}/9`)
+
+      if (Object.keys(capturedMaps).length === 9 && !ocrRunning && !ocrDone) {
+        console.log('[MAP] All 9 — running OCR')
+        runOCR()
+      }
+    } catch (e) { console.error('[MAP]', e.message) }
   }
 
   try { bot._client.on('map', mapHandler) } catch (e) {}
   try { bot._client.on('map_data', mapHandler) } catch (e) {}
 
-  // ─── CHAT HANDLER ───
-  bot.on('message', (msg) => {
+  bot.on('message', async (msg) => {
     const text = msg.toString()
     console.log(`[CHAT] ${text}`)
 
@@ -167,16 +242,34 @@ function createBot() {
       bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     } else if (/\/login/i.test(text)) {
       bot.chat(`/login ${CONFIG.password}`)
-    } else if (/captcha/i.test(text) && !captchaSent) {
-      sendDiscordText(`🔐 CAPTCHA prompt detected. Waiting 3s for map data...`)
-      setTimeout(() => flushMaps(), 3000)
+    } else if (/enter the captcha/i.test(text) && !captchaSubmitted) {
+      captchaSubmitted = true
+      console.log('[CAPTCHA] Prompt detected — waiting for OCR')
+
+      // Wait up to 20 sec for OCR
+      for (let i = 0; i < 40; i++) {
+        if (ocrDone) break
+        await new Promise(r => setTimeout(r, 500))
+      }
+
+      if (ocrAnswer) {
+        console.log(`[CAPTCHA] Auto-submitting: ${ocrAnswer}`)
+        bot.chat(ocrAnswer)
+        await sendDiscordText(`✅ Auto-submitted: **${ocrAnswer}**`)
+      } else {
+        console.log('[CAPTCHA] OCR failed — manual mode')
+        const s = stitchMaps()
+        if (s) await sendDiscordImage(s, '⚠️ Manual solve — reply `!captcha <answer>`')
+        startManualPoll()
+      }
     }
   })
 
   bot.on('login', () => {
-    console.log(`[BOT] Logged in as ${bot.username}`)
+    console.log(`[BOT] ✅ Logged in as ${bot.username}`)
     botStatus = 'online'
-    sendDiscordText(`✅ Bot **${bot.username}** joined`)
+    reconnectDelay = 30000
+    sendDiscordText(`✅ Bot **${bot.username}** connected`)
 
     setInterval(() => {
       if (bot.entity) {
@@ -188,79 +281,44 @@ function createBot() {
 
   bot.on('kicked', (reason) => {
     const r = typeof reason === 'string' ? reason : JSON.stringify(reason)
-    console.log(`[BOT] Kicked: ${r}`)
+    console.log(`[BOT] ❌ Kicked: ${r}`)
     botStatus = 'kicked'
-    sendDiscordText(`❌ Kicked: ${r}`)
-    setTimeout(createBot, 15000)
+
+    if (/already connected|too fast/i.test(r)) {
+      reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT)
+      console.log(`[BOT] Backoff → ${reconnectDelay/1000}s`)
+    } else {
+      reconnectDelay = 30000
+    }
+
+    sendDiscordText(`❌ Kicked: ${r}\nRetry in ${reconnectDelay/1000}s`)
+    setTimeout(createBot, reconnectDelay)
   })
 
   bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
-
   bot.on('end', (reason) => {
-    console.log(`[BOT] Disconnected: ${reason}`)
+    console.log(`[BOT] Disconnected`)
     botStatus = 'disconnected'
-    setTimeout(createBot, 15000)
+    setTimeout(createBot, reconnectDelay)
   })
 }
 
-// ─── FLUSH MAPS TO DISCORD ───
-async function flushMaps() {
-  if (captchaSent) return
-
-  const count = Object.keys(capturedMaps).length
-  if (count === 0) {
-    console.log('[CAPTCHA] No maps yet — waiting 3 more seconds')
-    await new Promise(r => setTimeout(r, 3000))
-  }
-
-  const finalCount = Object.keys(capturedMaps).length
-  if (finalCount === 0) {
-    await sendDiscordText('⚠️ No map data received from server')
-    return
-  }
-
-  captchaSent = true
-  console.log(`[CAPTCHA] Sending ${finalCount} maps to Discord`)
-
-  // Sort by map ID ascending (oldest/lowest first = usually top-left of grid)
-  const ids = Object.keys(capturedMaps).map(Number).sort((a, b) => a - b)
-
-  for (const id of ids) {
-    await sendDiscordImage(capturedMaps[id], `Map ${id}`)
-  }
-
-  await sendDiscordText(
-    `🔐 **${finalCount} CAPTCHA maps sent above.**\n` +
-    `Read them and reply:\n` +
-    `\`!captcha <answer>\`\n` +
-    `Example: \`!captcha UqUt\`\n` +
-    `You have 5 minutes.`
-  )
-
-  startPolling()
-}
-
-// ─── POLL DISCORD FOR ANSWER ───
-async function startPolling() {
-  if (pollingActive) return
-  pollingActive = true
-
-  console.log('[CAPTCHA] Polling Discord for answer...')
-  for (let i = 0; i < 60; i++) {
-    await new Promise(r => setTimeout(r, 5000))
-    const ans = await fetchCaptchaAnswer()
+async function startManualPoll() {
+  if (manualPolling) return
+  manualPolling = true
+  console.log('[CAPTCHA] Manual poll active')
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 1000))
+    const ans = await fetchManualAnswer()
     if (ans) {
-      console.log(`[CAPTCHA] Got answer: ${ans}`)
-      if (currentBot) {
-        currentBot.chat(ans)
-        sendDiscordText(`✅ Sent to Minecraft: **${ans}**`)
-      }
-      pollingActive = false
+      console.log(`[CAPTCHA] Manual: ${ans}`)
+      if (currentBot) currentBot.chat(ans)
+      sendDiscordText(`✅ Sent: **${ans}**`)
+      manualPolling = false
       return
     }
   }
-  sendDiscordText('⏰ CAPTCHA timed out (5 minutes)')
-  pollingActive = false
+  manualPolling = false
 }
 
-console.log('═══ MINEFORT BOT — FINAL ═══')
+console.log('═══ MINEFORT BOT — AUTO OCR v1 ═══')
