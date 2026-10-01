@@ -5,13 +5,12 @@
   "scripts": {
     "start": "node bot.js"
   },
-    "dependencies": {
+  "dependencies": {
     "mineflayer": "^4.27.0",
     "prismarine-item": "^1.16.0",
     "pngjs": "^7.0.0",
     "axios": "^1.7.0",
     "express": "^4.21.0",
     "form-data": "^4.0.0"
-  }
   }
 }
