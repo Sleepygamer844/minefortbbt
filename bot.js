@@ -1,4 +1,4 @@
-require('dotenv').config()
+
 const mineflayer = require('mineflayer')
 const { mapDownloader } = require('mineflayer-item-map-downloader')
 const axios = require('axios')
