@@ -42,34 +42,23 @@ function paletteColor(id) {
   const shadeIdx = (id - 1) & 3
   const base = BASE[baseIdx] || [0, 0, 0]
   const mult = SHADES[shadeIdx] / 255
-  return [
-    Math.min(255, Math.floor(base[0] * mult)),
-    Math.min(255, Math.floor(base[1] * mult)),
-    Math.min(255, Math.floor(base[2] * mult)),
-    255
-  ]
+  return [Math.min(255, Math.floor(base[0]*mult)), Math.min(255, Math.floor(base[1]*mult)), Math.min(255, Math.floor(base[2]*mult)), 255]
 }
 
-// ─── HTTP SERVER FIRST ───
 const app = express()
 const PORT = process.env.PORT || 3000
 let botStatus = 'starting'
 
-app.get('/', (req, res) => {
-  res.json({ status: botStatus, bot: CONFIG.username, uptime: Math.floor(process.uptime()) + 's' })
-})
-
+app.get('/', (req, res) => res.json({ status: botStatus, uptime: Math.floor(process.uptime()) + 's' }))
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[HTTP] Listening on ${PORT}`)
   setTimeout(createBot, 1000)
 })
 
-// ─── DISCORD HELPERS ───
 async function sendDiscordText(message) {
   if (!CONFIG.discordWebhook) return
-  try {
-    await axios.post(CONFIG.discordWebhook, { content: String(message).substring(0, 1900) })
-  } catch (err) { console.error('[DISCORD]', err.message) }
+  try { await axios.post(CONFIG.discordWebhook, { content: String(message).substring(0, 1900) }) }
+  catch (err) { console.error('[DISCORD]', err.message) }
 }
 
 async function sendDiscordImage(imagePath, caption) {
@@ -80,7 +69,7 @@ async function sendDiscordImage(imagePath, caption) {
     form.append('file', fs.createReadStream(imagePath), { filename: path.basename(imagePath) })
     await axios.post(CONFIG.discordWebhook, form, { headers: form.getHeaders() })
     console.log('[DISCORD] Sent image:', path.basename(imagePath))
-  } catch (err) { console.error('[DISCORD] Image failed:', err.message) }
+  } catch (err) { console.error('[DISCORD]', err.message) }
 }
 
 async function fetchManualAnswer() {
@@ -145,35 +134,97 @@ function stitchMaps() {
   return out
 }
 
-// ─── RUN OCR ───
+// ─── UPSCALE + THRESHOLD (makes OCR way better) ───
+function preprocessImage(inputPath, outputPath, scale = 3, threshold = 128) {
+  const src = PNG.sync.read(fs.readFileSync(inputPath))
+  const W = src.width * scale
+  const H = src.height * scale
+  const out = new PNG({ width: W, height: H })
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const sx = Math.floor(x / scale)
+      const sy = Math.floor(y / scale)
+      const sp = (sy * src.width + sx) * 4
+      const dp = (y * W + x) * 4
+
+      const r = src.data[sp]
+      const g = src.data[sp + 1]
+      const b = src.data[sp + 2]
+      const a = src.data[sp + 3]
+
+      // Grayscale
+      const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b)
+
+      // Threshold to pure black/white
+      const v = gray < threshold ? 0 : 255
+
+      out.data[dp] = v
+      out.data[dp + 1] = v
+      out.data[dp + 2] = v
+      out.data[dp + 3] = a
+    }
+  }
+
+  fs.writeFileSync(outputPath, PNG.sync.write(out))
+  return outputPath
+}
+
+// ─── RUN OCR (multi-pass, picks best) ───
 async function runOCR() {
   if (ocrRunning || ocrDone) return
   ocrRunning = true
 
-  const img = stitchMaps()
-  if (!img) {
-    console.log('[OCR] Not enough maps to stitch')
-    ocrRunning = false
-    return
-  }
+  const stitched = stitchMaps()
+  if (!stitched) { ocrRunning = false; return }
 
-  await sendDiscordImage(img, '🧩 Stitched CAPTCHA (bot view)')
+  // Send original to Discord
+  await sendDiscordImage(stitched, '🧩 Stitched CAPTCHA (bot view)')
+
+  const results = []
 
   try {
-    console.log('[OCR] Running Tesseract...')
-    const { data } = await Tesseract.recognize(img, 'eng', {
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
-      tessedit_pageseg_mode: '7'
-    })
-    const raw = data.text.replace(/\s+/g, '')
-    const cleaned = raw.replace(/[^A-Za-z0-9]/g, '')
-    console.log(`[OCR] Raw: "${raw}" Cleaned: "${cleaned}" Conf: ${Math.round(data.confidence)}`)
+    // Preprocess: 3x upscale + threshold
+    const pre1 = preprocessImage(stitched, path.join(MAP_DIR, 'pre1.png'), 3, 100)
+    const pre2 = preprocessImage(stitched, path.join(MAP_DIR, 'pre2.png'), 4, 150)
 
-    if (cleaned.length >= 3 && cleaned.length <= 8) {
-      ocrAnswer = cleaned
-      await sendDiscordText(`🤖 OCR guess: \`${cleaned}\` (${Math.round(data.confidence)}% conf)`)
+    // Also send the preprocessed version so you can see what OCR sees
+    await sendDiscordImage(pre1, '🔎 Preprocessed (what OCR sees)')
+
+    // Multiple OCR passes
+    const passes = [
+      { img: pre1, psm: '7' },
+      { img: pre1, psm: '8' },
+      { img: pre1, psm: '13' },
+      { img: pre2, psm: '7' },
+      { img: pre2, psm: '8' },
+      { img: stitched, psm: '7' }
+    ]
+
+    for (const pass of passes) {
+      try {
+        const { data } = await Tesseract.recognize(pass.img, 'eng', {
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+          tessedit_pageseg_mode: pass.psm
+        })
+        const cleaned = data.text.replace(/[^A-Za-z]/g, '')
+        console.log(`[OCR] psm=${pass.psm} → "${cleaned}" (${Math.round(data.confidence)}%)`)
+        if (cleaned.length >= 3 && cleaned.length <= 8) {
+          results.push({ text: cleaned, conf: data.confidence })
+        }
+      } catch (e) {
+        console.error('[OCR pass]', e.message)
+      }
+    }
+
+    if (results.length === 0) {
+      await sendDiscordText('⚠️ All OCR passes failed to find readable text')
     } else {
-      await sendDiscordText(`⚠️ OCR unclear: \`${cleaned}\` (${Math.round(data.confidence)}% conf)`)
+      // Highest confidence wins
+      results.sort((a, b) => b.conf - a.conf)
+      ocrAnswer = results[0].text
+      const summary = results.map(r => `\`${r.text}\` (${Math.round(r.conf)}%)`).join('\n')
+      await sendDiscordText(`🤖 OCR results:\n${summary}\n\n**Best:** \`${ocrAnswer}\``)
     }
   } catch (e) {
     console.error('[OCR]', e.message)
@@ -193,7 +244,7 @@ function createBot() {
   ocrDone = false
   ocrRunning = false
 
-  console.log(`[BOT] Connecting... (prev delay ${reconnectDelay/1000}s)`)
+  console.log(`[BOT] Connecting... (delay ${reconnectDelay/1000}s)`)
   const bot = mineflayer.createBot({
     host: CONFIG.host,
     port: CONFIG.port,
@@ -244,22 +295,21 @@ function createBot() {
       bot.chat(`/login ${CONFIG.password}`)
     } else if (/enter the captcha/i.test(text) && !captchaSubmitted) {
       captchaSubmitted = true
-      console.log('[CAPTCHA] Prompt detected — waiting for OCR')
+      console.log('[CAPTCHA] Prompt — waiting for OCR')
 
-      // Wait up to 20 sec for OCR
-      for (let i = 0; i < 40; i++) {
+      for (let i = 0; i < 30; i++) {
         if (ocrDone) break
         await new Promise(r => setTimeout(r, 500))
       }
 
       if (ocrAnswer) {
-        console.log(`[CAPTCHA] Auto-submitting: ${ocrAnswer}`)
+        console.log(`[CAPTCHA] Submitting: ${ocrAnswer}`)
         bot.chat(ocrAnswer)
         await sendDiscordText(`✅ Auto-submitted: **${ocrAnswer}**`)
       } else {
-        console.log('[CAPTCHA] OCR failed — manual mode')
+        console.log('[CAPTCHA] No OCR — manual fallback')
         const s = stitchMaps()
-        if (s) await sendDiscordImage(s, '⚠️ Manual solve — reply `!captcha <answer>`')
+        if (s) await sendDiscordImage(s, '⚠️ Manual — reply `!captcha <answer>`')
         startManualPoll()
       }
     }
@@ -286,7 +336,6 @@ function createBot() {
 
     if (/already connected|too fast/i.test(r)) {
       reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT)
-      console.log(`[BOT] Backoff → ${reconnectDelay/1000}s`)
     } else {
       reconnectDelay = 30000
     }
@@ -296,7 +345,7 @@ function createBot() {
   })
 
   bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
-  bot.on('end', (reason) => {
+  bot.on('end', () => {
     console.log(`[BOT] Disconnected`)
     botStatus = 'disconnected'
     setTimeout(createBot, reconnectDelay)
@@ -306,14 +355,12 @@ function createBot() {
 async function startManualPoll() {
   if (manualPolling) return
   manualPolling = true
-  console.log('[CAPTCHA] Manual poll active')
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, 1000))
     const ans = await fetchManualAnswer()
     if (ans) {
-      console.log(`[CAPTCHA] Manual: ${ans}`)
       if (currentBot) currentBot.chat(ans)
-      sendDiscordText(`✅ Sent: **${ans}**`)
+      sendDiscordText(`✅ Manual sent: **${ans}**`)
       manualPolling = false
       return
     }
@@ -321,4 +368,4 @@ async function startManualPoll() {
   manualPolling = false
 }
 
-console.log('═══ MINEFORT BOT — AUTO OCR v1 ═══')
+console.log('═══ MINEFORT BOT — OCR v2 (multi-pass) ═══')
