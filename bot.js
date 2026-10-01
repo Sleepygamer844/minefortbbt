@@ -94,13 +94,8 @@ async function fetchManualAnswer() {
   return null
 }
 
-// ─── GEMINI VISION API ───
 async function askGemini(imagePath) {
-  if (!CONFIG.geminiApiKey) {
-    console.log('[GEMINI] No API key set')
-    return null
-  }
-
+  if (!CONFIG.geminiApiKey) return null
   try {
     const imageBuffer = fs.readFileSync(imagePath)
     const base64Image = imageBuffer.toString('base64')
@@ -110,14 +105,11 @@ async function askGemini(imagePath) {
     const body = {
       contents: [{
         parts: [
-          { text: 'This is a CAPTCHA from a Minecraft server. It shows letters in a grid. Read them left-to-right, top-to-bottom. Reply with ONLY the letters/numbers, nothing else. No explanation, no punctuation, just the characters.' },
+          { text: 'This is a Minecraft CAPTCHA image with 9 tiles in a 3x3 grid. Each tile shows 1 letter or number. Read them LEFT-TO-RIGHT, TOP-TO-BOTTOM and output ONLY the letters/numbers with no spaces or explanation. If a tile is empty, skip it. Just reply with the characters.' },
           { inline_data: { mime_type: 'image/png', data: base64Image } }
         ]
       }],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 20
-      }
+      generationConfig: { temperature: 0.1, maxOutputTokens: 20 }
     }
 
     const t0 = Date.now()
@@ -125,23 +117,17 @@ async function askGemini(imagePath) {
       headers: { 'Content-Type': 'application/json' },
       timeout: 10000
     })
-    const elapsed = Date.now() - t0
-    console.log(`[GEMINI] Response in ${elapsed}ms`)
+    console.log(`[GEMINI] ${Date.now() - t0}ms`)
 
     const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
     console.log(`[GEMINI] Raw: "${text}"`)
 
     const cleaned = text.replace(/[^A-Za-z0-9]/g, '')
-    if (cleaned.length >= 3 && cleaned.length <= 8) {
-      return cleaned
-    }
-    console.log(`[GEMINI] Cleaned too short/long: "${cleaned}"`)
+    if (cleaned.length >= 3 && cleaned.length <= 8) return cleaned
     return null
   } catch (err) {
-    console.error('[GEMINI] Error:', err.message)
-    if (err.response) {
-      console.error('[GEMINI] Response:', JSON.stringify(err.response.data).substring(0, 500))
-    }
+    console.error('[GEMINI]', err.message)
+    if (err.response) console.error('[GEMINI]', JSON.stringify(err.response.data).substring(0, 400))
     return null
   }
 }
@@ -192,73 +178,106 @@ function collectFrames(bot) {
   return out
 }
 
-function stitchByWorldOrder(bot) {
+// ─── STITCH HELPERS ───
+function stitchFiles(files, outName) {
+  const TILE = 128
+  const SIZE = TILE * 3
+  const stitched = new PNG({ width: SIZE, height: SIZE })
+
+  // Initialize to white
+  for (let i = 0; i < stitched.data.length; i += 4) {
+    stitched.data[i] = 255
+    stitched.data[i+1] = 255
+    stitched.data[i+2] = 255
+    stitched.data[i+3] = 255
+  }
+
+  for (let i = 0; i < files.length && i < 9; i++) {
+    try {
+      const src = PNG.sync.read(fs.readFileSync(files[i]))
+      const col = i % 3
+      const row = Math.floor(i / 3)
+      for (let y = 0; y < TILE; y++) {
+        for (let x = 0; x < TILE; x++) {
+          const sp = (y * TILE + x) * 4
+          const dp = ((row * TILE + y) * SIZE + (col * TILE + x)) * 4
+          stitched.data[dp] = src.data[sp]
+          stitched.data[dp+1] = src.data[sp+1]
+          stitched.data[dp+2] = src.data[sp+2]
+          stitched.data[dp+3] = src.data[sp+3]
+        }
+      }
+    } catch (e) {
+      console.error(`[STITCH] Tile ${i} failed:`, e.message)
+    }
+  }
+
+  const out = path.join(MAP_DIR, outName)
+  fs.writeFileSync(out, PNG.sync.write(stitched))
+  return out
+}
+
+function stitchByPosition(bot) {
   const frames = collectFrames(bot)
-  if (frames.length !== 9) return null
+  if (frames.length === 0) return null
 
   frames.sort((a, b) => {
     if (a.y !== b.y) return b.y - a.y
     return a.z - b.z
   })
 
-  const TILE = 128
-  const SIZE = TILE * 3
-  const stitched = new PNG({ width: SIZE, height: SIZE })
+  return stitchFiles(frames.map(f => f.file), 'stitched_pos.png')
+}
 
-  for (let i = 0; i < 9; i++) {
-    const src = PNG.sync.read(fs.readFileSync(frames[i].file))
-    const col = i % 3
-    const row = Math.floor(i / 3)
-    for (let y = 0; y < TILE; y++) {
-      for (let x = 0; x < TILE; x++) {
-        const sp = (y * TILE + x) * 4
-        const dp = ((row * TILE + y) * SIZE + (col * TILE + x)) * 4
-        stitched.data[dp] = src.data[sp]
-        stitched.data[dp+1] = src.data[sp+1]
-        stitched.data[dp+2] = src.data[sp+2]
-        stitched.data[dp+3] = src.data[sp+3]
-      }
-    }
-  }
-
-  const out = path.join(MAP_DIR, 'stitched.png')
-  fs.writeFileSync(out, PNG.sync.write(stitched))
-  return out
+function stitchByIdOrder() {
+  const ids = Object.keys(capturedMaps).map(Number).sort((a, b) => a - b)
+  if (ids.length === 0) return null
+  return stitchFiles(ids.map(id => capturedMaps[id]), 'stitched_id.png')
 }
 
 async function handleCaptcha(bot) {
   if (handled) return
   handled = true
 
-  console.log('[CAPTCHA] Handling...')
+  const mapCount = Object.keys(capturedMaps).length
+  console.log(`[CAPTCHA] Handling with ${mapCount} maps`)
 
-  // Stitch
-  const stitched = stitchByWorldOrder(bot)
+  // Try position-based stitch
+  let stitched = null
+  let method = 'none'
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    stitched = stitchByPosition(bot)
+    if (stitched) { method = 'position'; break }
+    await new Promise(r => setTimeout(r, 300))
+  }
+
   if (!stitched) {
-    console.log('[CAPTCHA] Stitch failed')
-    sendDiscordText('⚠️ Could not stitch maps')
+    console.log(`[CAPTCHA] Position failed (${mapCount} maps) — trying ID order`)
+    stitched = stitchByIdOrder()
+    method = 'id'
+  }
+
+  if (!stitched) {
+    console.log('[CAPTCHA] ❌ Both stitch methods failed')
+    sendDiscordText(`⚠️ Could not stitch (only ${mapCount} maps)`)
     return
   }
 
-  // Send to Discord as backup
-  await sendDiscordImage(stitched, '🤖 **AI is reading this — Discord reply is backup only**')
+  console.log(`[CAPTCHA] ✅ Stitched via ${method} — sending`)
 
-  // Start manual poll in parallel (in case AI fails)
+  await sendDiscordImage(stitched, `🤖 **AI reading (${method} order)** — Discord reply is backup`)
   startFastPoll()
 
-  // Ask Gemini
   const aiAnswer = await askGemini(stitched)
 
   if (aiAnswer && !pollActive) {
-    console.log(`[CAPTCHA] ✅ AI answer: ${aiAnswer}`)
+    console.log(`[CAPTCHA] ✅ AI: ${aiAnswer}`)
     bot.chat(aiAnswer)
     sendDiscordText(`🤖 **AI submitted: \`${aiAnswer}\`**`)
-  } else if (aiAnswer) {
-    // Manual was already done, ignore
-    console.log(`[CAPTCHA] Manual already submitted`)
-  } else {
-    console.log('[CAPTCHA] ⚠️ AI failed — waiting for manual Discord reply')
-    sendDiscordText('⚠️ **AI could not read it.** Please reply `!captcha <code>` FAST!')
+  } else if (!aiAnswer) {
+    console.log('[CAPTCHA] ⚠️ AI failed — manual backup')
+    sendDiscordText('⚠️ **AI failed — reply `!captcha <code>` FAST!**')
   }
 }
 
@@ -296,11 +315,12 @@ function createBot() {
       const file = path.join(MAP_DIR, `map_${id}.png`)
       fs.writeFileSync(file, PNG.sync.write(png))
       capturedMaps[id] = file
-      console.log(`[MAP] ${Object.keys(capturedMaps).length}/9`)
+      console.log(`[MAP] ${Object.keys(capturedMaps).length}/9 (id=${id})`)
 
-      if (Object.keys(capturedMaps).length === 9 && !handled) {
-        // Give frames 300ms to register as entities
-        setTimeout(() => handleCaptcha(bot), 300)
+      // Trigger once we hit 9 OR more
+      if (Object.keys(capturedMaps).length >= 9 && !handled) {
+        console.log(`[CAPTCHA] Got ${Object.keys(capturedMaps).length} maps — triggering handler`)
+        setTimeout(() => handleCaptcha(bot), 500)
       }
     } catch (e) { console.error('[MAP]', e.message) }
   }
@@ -315,8 +335,8 @@ function createBot() {
     if (/\/register/i.test(text)) bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     else if (/\/login/i.test(text)) bot.chat(`/login ${CONFIG.password}`)
     else if (/enter the captcha/i.test(text) && !handled) {
-      console.log('[CAPTCHA] Prompt detected')
-      setTimeout(() => handleCaptcha(bot), 100)
+      console.log('[CAPTCHA] Chat prompt — triggering')
+      setTimeout(() => handleCaptcha(bot), 200)
     }
   })
 
@@ -324,7 +344,6 @@ function createBot() {
     console.log(`[BOT] ✅ Logged in`)
     reconnectDelay = 30000
     sendDiscordText(`✅ Bot connected`)
-
     setInterval(() => {
       if (bot.entity) {
         bot.setControlState('jump', true)
@@ -336,32 +355,25 @@ function createBot() {
   bot.on('kicked', (reason) => {
     const r = typeof reason === 'string' ? reason : JSON.stringify(reason)
     console.log(`[BOT] ❌ Kicked: ${r}`)
-
     if (/already connected|too fast/i.test(r)) {
       reconnectDelay = Math.min(reconnectDelay * 2, 300000)
     } else {
       reconnectDelay = 30000
     }
-
     sendDiscordText(`❌ Kicked. Retry in ${reconnectDelay/1000}s`)
     setTimeout(createBot, reconnectDelay)
   })
 
   bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
-  bot.on('end', () => {
-    setTimeout(createBot, reconnectDelay)
-  })
+  bot.on('end', () => setTimeout(createBot, reconnectDelay))
 }
 
 async function startFastPoll() {
   if (pollActive) return
   pollActive = true
-  console.log('[CAPTCHA] Manual poll active')
-
   for (let i = 0; i < 80; i++) {
     const ans = await fetchManualAnswer()
     if (ans) {
-      console.log(`[CAPTCHA] Manual: ${ans}`)
       if (currentBot) currentBot.chat(ans)
       sendDiscordText(`👤 **You submitted: \`${ans}\`**`)
       pollActive = false
@@ -372,5 +384,5 @@ async function startFastPoll() {
   pollActive = false
 }
 
-console.log('═══ MINEFORT BOT — v8 (AI-powered) ═══')
-console.log(`Gemini API key: ${CONFIG.geminiApiKey ? '✅ set' : '❌ missing'}`)
+console.log('═══ MINEFORT BOT — v10 (robust stitch) ═══')
+console.log(`Gemini: ${CONFIG.geminiApiKey ? '✅' : '❌'}`)
