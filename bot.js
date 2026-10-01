@@ -18,12 +18,7 @@ const PORT = process.env.PORT || 3000
 let status = 'starting'
 
 app.get('/', (req, res) => {
-  res.json({
-    status,
-    bot: CONFIG.username,
-    server: CONFIG.host,
-    uptime: Math.floor(process.uptime()) + 's'
-  })
+  res.json({ status, bot: CONFIG.username, uptime: Math.floor(process.uptime()) + 's' })
 })
 
 app.listen(PORT, () => console.log(`[HTTP] Listening on port ${PORT}`))
@@ -31,10 +26,8 @@ app.listen(PORT, () => console.log(`[HTTP] Listening on port ${PORT}`))
 async function sendDiscordText(message) {
   if (!CONFIG.discordWebhook) return
   try {
-    await axios.post(CONFIG.discordWebhook, { content: message })
-  } catch (err) {
-    console.error('[DISCORD] Text failed:', err.message)
-  }
+    await axios.post(CONFIG.discordWebhook, { content: message.substring(0, 1900) })
+  } catch (err) { console.error('[DISCORD]', err.message) }
 }
 
 async function fetchCaptchaAnswer() {
@@ -54,15 +47,13 @@ async function fetchCaptchaAnswer() {
         return ans
       }
     }
-  } catch (err) {
-    console.error('[DISCORD] Poll failed:', err.message)
-  }
+  } catch (err) { console.error('[DISCORD]', err.message) }
   return null
 }
 
 function createBot() {
   status = 'connecting'
-  console.log(`[BOT] Connecting to ${CONFIG.host}:${CONFIG.port}`)
+  console.log(`[BOT] Connecting...`)
 
   const bot = mineflayer.createBot({
     host: CONFIG.host,
@@ -77,14 +68,12 @@ function createBot() {
     console.log(`[CHAT] ${text}`)
 
     if (/\/register/i.test(text)) {
-      console.log('[AUTH] Registering...')
       bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     } else if (/\/login/i.test(text)) {
-      console.log('[AUTH] Logging in...')
       bot.chat(`/login ${CONFIG.password}`)
     } else if (/captcha|verification|verify/i.test(text)) {
-      console.log('[CAPTCHA] Keyword in chat — sending to Discord')
-      sendDiscordText(`🔐 **CAPTCHA prompt:**\n\`\`\`${text}\`\`\`\nReply with \`!captcha <answer>\``)
+      sendDiscordText(`🔐 CAPTCHA prompt:\n\`\`\`${text}\`\`\`\nDiagnosing...`)
+      setTimeout(() => diagnose(bot), 3000)
       pollForAnswer(bot)
     }
   })
@@ -92,7 +81,7 @@ function createBot() {
   bot.on('login', () => {
     console.log(`[BOT] Logged in as ${bot.username}`)
     status = 'online'
-    sendDiscordText(`✅ **${CONFIG.username}** joined **${CONFIG.host}**`)
+    sendDiscordText(`✅ Bot joined as **${bot.username}**`)
 
     setInterval(() => {
       if (bot.entity) {
@@ -101,19 +90,8 @@ function createBot() {
       }
     }, 30000)
 
-    setInterval(() => {
-      sendDiscordText(`🟢 **${CONFIG.username}** still online (${Math.floor(bot.time.age / 1200)} min)`)
-    }, 3600000)
-  })
-
-  bot.on('chat', (username, message) => {
-    if (username === bot.username) return
-    const lower = message.toLowerCase()
-    if (lower.includes('hello') || lower.includes('hi ')) {
-      bot.chat(`Hi ${username}!`)
-    } else if (lower.includes('afk')) {
-      bot.chat(`Yes, I'm an AFK bot!`)
-    }
+    // Diagnose 5 seconds after login (in case CAPTCHA appears)
+    setTimeout(() => diagnose(bot), 5000)
   })
 
   bot.on('kicked', (reason) => {
@@ -124,38 +102,92 @@ function createBot() {
     setTimeout(createBot, 15000)
   })
 
-  bot.on('error', (err) => {
-    console.log(`[BOT] Error: ${err.message}`)
-  })
+  bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
 
   bot.on('end', (reason) => {
     console.log(`[BOT] Disconnected: ${reason}`)
     status = 'disconnected'
-    sendDiscordText(`🔌 Disconnected: ${reason}`)
     setTimeout(createBot, 15000)
   })
 }
 
+// ─── DIAGNOSTIC: dump inventory + nearby entities ───
+async function diagnose(bot) {
+  console.log('[DIAG] Running diagnostic...')
+  let report = '📋 **DIAGNOSTIC REPORT**\n'
+
+  // Inventory
+  try {
+    const items = bot.inventory.items()
+    if (items.length === 0) {
+      report += '\n**Inventory:** empty\n'
+    } else {
+      report += '\n**Inventory items:**\n'
+      for (const item of items) {
+        report += `• \`${item.name}\` x${item.count}\n`
+      }
+    }
+  } catch (e) {
+    report += '\n**Inventory error:** ' + e.message + '\n'
+  }
+
+  // Held item
+  try {
+    const held = bot.heldItem
+    if (held) {
+      report += `\n**Held item:** \`${held.name}\` x${held.count}\n`
+    } else {
+      report += '\n**Held item:** none\n'
+    }
+  } catch (e) {}
+
+  // Nearby entities (paintings, item frames)
+  try {
+    const entities = Object.values(bot.entities)
+    const nearby = entities.filter(e => {
+      if (!e.position || !bot.entity) return false
+      const dx = e.position.x - bot.entity.position.x
+      const dy = e.position.y - bot.entity.position.y
+      const dz = e.position.z - bot.entity.position.z
+      return (dx*dx + dy*dy + dz*dz) < 400 // within 20 blocks
+    })
+    const interesting = nearby.filter(e =>
+      ['painting', 'item_frame', 'glow_item_frame', 'armor_stand', 'item'].includes(e.name)
+    )
+    if (interesting.length > 0) {
+      report += '\n**Nearby entities:**\n'
+      for (const e of interesting.slice(0, 10)) {
+        report += `• \`${e.name}\` at ${Math.floor(e.position.x)}, ${Math.floor(e.position.y)}, ${Math.floor(e.position.z)}\n`
+      }
+    } else {
+      report += '\n**Nearby entities:** none relevant\n'
+    }
+  } catch (e) {
+    report += '\n**Entity error:** ' + e.message + '\n'
+  }
+
+  // Position
+  if (bot.entity) {
+    const p = bot.entity.position
+    report += `\n**Position:** ${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}`
+  }
+
+  await sendDiscordText(report)
+  console.log('[DIAG] Sent report to Discord')
+}
+
 async function pollForAnswer(bot) {
-  console.log('[CAPTCHA] Polling Discord for answer...')
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 5000))
     const answer = await fetchCaptchaAnswer()
     if (answer) {
-      console.log(`[CAPTCHA] Sending answer: ${answer}`)
+      console.log(`[CAPTCHA] Sending: ${answer}`)
       bot.chat(answer)
-      sendDiscordText(`✅ CAPTCHA answer sent: **${answer}**`)
+      sendDiscordText(`✅ Sent answer: **${answer}**`)
       return
     }
   }
-  console.log('[CAPTCHA] Timed out')
-  sendDiscordText(`⏰ CAPTCHA timed out`)
 }
 
-console.log('═══════════════════════════════')
-console.log('  MINEFORT AFK BOT — tpstoohigh')
-console.log('═══════════════════════════════')
-console.log(`Host: ${CONFIG.host}`)
-console.log(`Version: ${CONFIG.version || 'auto'}`)
-
+console.log('═══ MINEFORT BOT — DIAGNOSTIC VERSION ═══')
 createBot()
