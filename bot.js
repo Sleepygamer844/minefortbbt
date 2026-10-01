@@ -47,9 +47,7 @@ function paletteColor(id) {
 
 const app = express()
 const PORT = process.env.PORT || 3000
-let botStatus = 'starting'
-
-app.get('/', (req, res) => res.json({ status: botStatus, uptime: Math.floor(process.uptime()) + 's' }))
+app.get('/', (req, res) => res.json({ status: 'ok' }))
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[HTTP] Listening on ${PORT}`)
   setTimeout(createBot, 1000)
@@ -68,7 +66,6 @@ async function sendDiscordImage(imagePath, caption) {
     form.append('content', caption || '')
     form.append('file', fs.createReadStream(imagePath), { filename: path.basename(imagePath) })
     await axios.post(CONFIG.discordWebhook, form, { headers: form.getHeaders() })
-    console.log('[DISCORD] Sent image:', path.basename(imagePath))
   } catch (err) { console.error('[DISCORD]', err.message) }
 }
 
@@ -95,26 +92,84 @@ async function fetchManualAnswer() {
 
 // ─── STATE ───
 let currentBot = null
-let capturedMaps = {}
+let capturedMaps = {}       // id → file path
+let frameInfo = []          // {id, x, y, z, file}
 let captchaSubmitted = false
 let ocrRunning = false
 let ocrAnswer = null
 let ocrDone = false
 let manualPolling = false
 let reconnectDelay = 30000
-const MAX_RECONNECT = 300000
 
-// ─── STITCH 9 MAPS ───
-function stitchMaps() {
-  const ids = Object.keys(capturedMaps).map(Number).sort((a, b) => a - b)
-  if (ids.length < 9) return null
+// ─── EXTRACT MAP ID FROM FRAME METADATA ───
+function extractMapId(nbtData) {
+  if (!nbtData) return null
+  let val = nbtData.value !== undefined ? nbtData.value : nbtData
+  if (!val || typeof val !== 'object') return null
+  for (const key of ['map', 'mapId', 'Map', 'MapId']) {
+    const entry = val[key]
+    if (entry === undefined || entry === null) continue
+    const inner = (entry && entry.value !== undefined) ? entry.value : entry
+    if (typeof inner === 'number') return inner
+  }
+  return null
+}
+
+// ─── COLLECT FRAMES WITH POSITION + MAP ID ───
+function collectFrames(bot) {
+  const frames = Object.values(bot.entities).filter(e => e && e.name && e.name.includes('item_frame'))
+  const out = []
+  for (const frame of frames) {
+    try {
+      const meta = frame.metadata || []
+      let mapId = null
+      for (let i = 0; i < meta.length && i < 20; i++) {
+        const v = meta[i]
+        if (v && typeof v === 'object' && v.nbtData) {
+          const id = extractMapId(v.nbtData)
+          if (id !== null) { mapId = id; break }
+        }
+      }
+      if (mapId !== null) {
+        out.push({
+          id: mapId,
+          x: Math.floor(frame.position.x),
+          y: Math.floor(frame.position.y),
+          z: Math.floor(frame.position.z),
+          file: capturedMaps[mapId]
+        })
+      }
+    } catch (e) {}
+  }
+  return out
+}
+
+// ─── STITCH USING FRAME POSITIONS ───
+function stitchByPosition(bot, outputName) {
+  const frames = collectFrames(bot)
+  if (frames.length !== 9) {
+    console.log(`[STITCH] Got ${frames.length} frames, need 9`)
+    return null
+  }
+
+  // Player at ~ (0, 116, 0), wall at x=-3, facing -X direction
+  // So: sort by Y DESC (top first), then by Z ASC (left→right from player's POV facing -X)
+  // Wait: if player faces -X, then right = +Z, left = -Z. So sort Z DESC = left→right.
+
+  // Frames are at Y=117,118,119 (bottom→top) and Z=-1,0,1 (left→right from player view)
+  // For grid [row][col]: row 0 = TOP (Y=119), col 0 = LEFT (Z=1 from player view is which side?)
+  // Let's try: sort by Y DESC, Z DESC → top-left first
+  frames.sort((a, b) => {
+    if (a.y !== b.y) return b.y - a.y  // higher Y first (top row first)
+    return b.z - a.z                    // higher Z first (leftmost from player view)
+  })
 
   const TILE = 128
   const SIZE = TILE * 3
   const stitched = new PNG({ width: SIZE, height: SIZE })
 
   for (let i = 0; i < 9; i++) {
-    const src = PNG.sync.read(fs.readFileSync(capturedMaps[ids[i]]))
+    const src = PNG.sync.read(fs.readFileSync(frames[i].file))
     const col = i % 3
     const row = Math.floor(i / 3)
     for (let y = 0; y < TILE; y++) {
@@ -122,20 +177,39 @@ function stitchMaps() {
         const sp = (y * TILE + x) * 4
         const dp = ((row * TILE + y) * SIZE + (col * TILE + x)) * 4
         stitched.data[dp] = src.data[sp]
-        stitched.data[dp + 1] = src.data[sp + 1]
-        stitched.data[dp + 2] = src.data[sp + 2]
-        stitched.data[dp + 3] = src.data[sp + 3]
+        stitched.data[dp+1] = src.data[sp+1]
+        stitched.data[dp+2] = src.data[sp+2]
+        stitched.data[dp+3] = src.data[sp+3]
       }
     }
   }
 
-  const out = path.join(MAP_DIR, 'stitched.png')
+  const out = path.join(MAP_DIR, outputName)
   fs.writeFileSync(out, PNG.sync.write(stitched))
   return out
 }
 
-// ─── UPSCALE + THRESHOLD (makes OCR way better) ───
-function preprocessImage(inputPath, outputPath, scale = 3, threshold = 128) {
+// ─── FLIP VERTICALLY (some CAPTCHA plugins flip) ───
+function flipVertical(inputPath, outputPath) {
+  const src = PNG.sync.read(fs.readFileSync(inputPath))
+  const out = new PNG({ width: src.width, height: src.height })
+  for (let y = 0; y < src.height; y++) {
+    for (let x = 0; x < src.width; x++) {
+      const sy = src.height - 1 - y
+      const sp = (sy * src.width + x) * 4
+      const dp = (y * src.width + x) * 4
+      out.data[dp] = src.data[sp]
+      out.data[dp+1] = src.data[sp+1]
+      out.data[dp+2] = src.data[sp+2]
+      out.data[dp+3] = src.data[sp+3]
+    }
+  }
+  fs.writeFileSync(outputPath, PNG.sync.write(out))
+  return outputPath
+}
+
+// ─── PREPROCESS: upscale + grayscale + mild contrast ───
+function preprocess(inputPath, outputPath, scale = 3, threshold = 128) {
   const src = PNG.sync.read(fs.readFileSync(inputPath))
   const W = src.width * scale
   const H = src.height * scale
@@ -147,22 +221,10 @@ function preprocessImage(inputPath, outputPath, scale = 3, threshold = 128) {
       const sy = Math.floor(y / scale)
       const sp = (sy * src.width + sx) * 4
       const dp = (y * W + x) * 4
-
-      const r = src.data[sp]
-      const g = src.data[sp + 1]
-      const b = src.data[sp + 2]
-      const a = src.data[sp + 3]
-
-      // Grayscale
+      const r = src.data[sp], g = src.data[sp+1], b = src.data[sp+2], a = src.data[sp+3]
       const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b)
-
-      // Threshold to pure black/white
       const v = gray < threshold ? 0 : 255
-
-      out.data[dp] = v
-      out.data[dp + 1] = v
-      out.data[dp + 2] = v
-      out.data[dp + 3] = a
+      out.data[dp] = v; out.data[dp+1] = v; out.data[dp+2] = v; out.data[dp+3] = a
     }
   }
 
@@ -170,79 +232,83 @@ function preprocessImage(inputPath, outputPath, scale = 3, threshold = 128) {
   return outputPath
 }
 
-// ─── RUN OCR (multi-pass, picks best) ───
-async function runOCR() {
+// ─── OCR: multiple images, multiple PSM ───
+async function tryOCR(imgPath, psm = '7') {
+  try {
+    const { data } = await Tesseract.recognize(imgPath, 'eng', {
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+      tessedit_pageseg_mode: psm
+    })
+    const cleaned = data.text.replace(/[^A-Za-z]/g, '')
+    return { text: cleaned, conf: data.confidence }
+  } catch (e) {
+    return null
+  }
+}
+
+async function runOCR(bot) {
   if (ocrRunning || ocrDone) return
   ocrRunning = true
-
-  const stitched = stitchMaps()
-  if (!stitched) { ocrRunning = false; return }
-
-  // Send original to Discord
-  await sendDiscordImage(stitched, '🧩 Stitched CAPTCHA (bot view)')
-
   const results = []
 
   try {
-    // Preprocess: 3x upscale + threshold
-    const pre1 = preprocessImage(stitched, path.join(MAP_DIR, 'pre1.png'), 3, 100)
-    const pre2 = preprocessImage(stitched, path.join(MAP_DIR, 'pre2.png'), 4, 150)
+    // Build 3 candidate images
+    const s1 = stitchByPosition(bot, 's1_normal.png')
+    if (s1) {
+      const s2 = flipVertical(s1, path.join(MAP_DIR, 's2_flipped.png'))
+      const p1 = preprocess(s1, path.join(MAP_DIR, 'p1_normal.png'), 3, 128)
+      const p2 = preprocess(s2, path.join(MAP_DIR, 'p2_flipped.png'), 3, 128)
 
-    // Also send the preprocessed version so you can see what OCR sees
-    await sendDiscordImage(pre1, '🔎 Preprocessed (what OCR sees)')
+      // Send all candidates to Discord for you to see
+      await sendDiscordImage(s1, '🧩 Stitched (normal order)')
+      await sendDiscordImage(s2, '🔄 Stitched (flipped vertically)')
+      await sendDiscordImage(p1, '🔎 Preprocessed (normal)')
+      await sendDiscordImage(p2, '🔎 Preprocessed (flipped)')
 
-    // Multiple OCR passes
-    const passes = [
-      { img: pre1, psm: '7' },
-      { img: pre1, psm: '8' },
-      { img: pre1, psm: '13' },
-      { img: pre2, psm: '7' },
-      { img: pre2, psm: '8' },
-      { img: stitched, psm: '7' }
-    ]
+      // OCR every combo
+      const combos = [
+        { name: 'normal-7', img: s1, psm: '7' },
+        { name: 'normal-8', img: s1, psm: '8' },
+        { name: 'flipped-7', img: s2, psm: '7' },
+        { name: 'flipped-8', img: s2, psm: '8' },
+        { name: 'pre-norm-7', img: p1, psm: '7' },
+        { name: 'pre-norm-8', img: p1, psm: '8' },
+        { name: 'pre-flip-7', img: p2, psm: '7' },
+        { name: 'pre-flip-8', img: p2, psm: '8' }
+      ]
 
-    for (const pass of passes) {
-      try {
-        const { data } = await Tesseract.recognize(pass.img, 'eng', {
-          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
-          tessedit_pageseg_mode: pass.psm
-        })
-        const cleaned = data.text.replace(/[^A-Za-z]/g, '')
-        console.log(`[OCR] psm=${pass.psm} → "${cleaned}" (${Math.round(data.confidence)}%)`)
-        if (cleaned.length >= 3 && cleaned.length <= 8) {
-          results.push({ text: cleaned, conf: data.confidence })
+      for (const c of combos) {
+        const r = await tryOCR(c.img, c.psm)
+        if (r && r.text.length >= 3 && r.text.length <= 8) {
+          console.log(`[OCR] ${c.name} → "${r.text}" (${Math.round(r.conf)}%)`)
+          results.push({ name: c.name, text: r.text, conf: r.conf })
         }
-      } catch (e) {
-        console.error('[OCR pass]', e.message)
       }
     }
 
     if (results.length === 0) {
-      await sendDiscordText('⚠️ All OCR passes failed to find readable text')
+      await sendDiscordText('⚠️ No OCR results')
     } else {
-      // Highest confidence wins
       results.sort((a, b) => b.conf - a.conf)
       ocrAnswer = results[0].text
-      const summary = results.map(r => `\`${r.text}\` (${Math.round(r.conf)}%)`).join('\n')
+      const summary = results.map(r => `\`${r.text}\` — ${r.name} (${Math.round(r.conf)}%)`).join('\n')
       await sendDiscordText(`🤖 OCR results:\n${summary}\n\n**Best:** \`${ocrAnswer}\``)
     }
   } catch (e) {
     console.error('[OCR]', e.message)
-    await sendDiscordText(`⚠️ OCR failed: ${e.message}`)
   }
 
   ocrDone = true
   ocrRunning = false
 }
 
-// ─── CREATE BOT ───
 function createBot() {
-  botStatus = 'connecting'
   captchaSubmitted = false
   capturedMaps = {}
   ocrAnswer = null
   ocrDone = false
   ocrRunning = false
+  frameInfo = []
 
   console.log(`[BOT] Connecting... (delay ${reconnectDelay/1000}s)`)
   const bot = mineflayer.createBot({
@@ -273,11 +339,11 @@ function createBot() {
       const file = path.join(MAP_DIR, `map_${id}.png`)
       fs.writeFileSync(file, PNG.sync.write(png))
       capturedMaps[id] = file
-      console.log(`[MAP] Captured ${Object.keys(capturedMaps).length}/9`)
+      console.log(`[MAP] Captured ${Object.keys(capturedMaps).length}/9 (id=${id})`)
 
       if (Object.keys(capturedMaps).length === 9 && !ocrRunning && !ocrDone) {
-        console.log('[MAP] All 9 — running OCR')
-        runOCR()
+        console.log('[MAP] All 9 — starting OCR')
+        runOCR(bot)
       }
     } catch (e) { console.error('[MAP]', e.message) }
   }
@@ -289,17 +355,15 @@ function createBot() {
     const text = msg.toString()
     console.log(`[CHAT] ${text}`)
 
-    if (/\/register/i.test(text)) {
-      bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
-    } else if (/\/login/i.test(text)) {
-      bot.chat(`/login ${CONFIG.password}`)
-    } else if (/enter the captcha/i.test(text) && !captchaSubmitted) {
+    if (/\/register/i.test(text)) bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
+    else if (/\/login/i.test(text)) bot.chat(`/login ${CONFIG.password}`)
+    else if (/enter the captcha/i.test(text) && !captchaSubmitted) {
       captchaSubmitted = true
       console.log('[CAPTCHA] Prompt — waiting for OCR')
 
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 20; i++) {
         if (ocrDone) break
-        await new Promise(r => setTimeout(r, 500))
+        await new Promise(r => setTimeout(r, 250))
       }
 
       if (ocrAnswer) {
@@ -307,19 +371,17 @@ function createBot() {
         bot.chat(ocrAnswer)
         await sendDiscordText(`✅ Auto-submitted: **${ocrAnswer}**`)
       } else {
-        console.log('[CAPTCHA] No OCR — manual fallback')
-        const s = stitchMaps()
-        if (s) await sendDiscordImage(s, '⚠️ Manual — reply `!captcha <answer>`')
+        const s = stitchByPosition(bot, 'manual.png')
+        if (s) await sendDiscordImage(s, '⚠️ Manual — reply `!captcha <answer>` FAST (15s)')
         startManualPoll()
       }
     }
   })
 
   bot.on('login', () => {
-    console.log(`[BOT] ✅ Logged in as ${bot.username}`)
-    botStatus = 'online'
+    console.log(`[BOT] ✅ Logged in`)
     reconnectDelay = 30000
-    sendDiscordText(`✅ Bot **${bot.username}** connected`)
+    sendDiscordText(`✅ Bot joined`)
 
     setInterval(() => {
       if (bot.entity) {
@@ -332,22 +394,18 @@ function createBot() {
   bot.on('kicked', (reason) => {
     const r = typeof reason === 'string' ? reason : JSON.stringify(reason)
     console.log(`[BOT] ❌ Kicked: ${r}`)
-    botStatus = 'kicked'
-
     if (/already connected|too fast/i.test(r)) {
-      reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT)
+      reconnectDelay = Math.min(reconnectDelay * 2, 300000)
     } else {
       reconnectDelay = 30000
     }
-
-    sendDiscordText(`❌ Kicked: ${r}\nRetry in ${reconnectDelay/1000}s`)
+    sendDiscordText(`❌ Kicked. Retry in ${reconnectDelay/1000}s`)
     setTimeout(createBot, reconnectDelay)
   })
 
   bot.on('error', (err) => console.log(`[BOT] Error: ${err.message}`))
   bot.on('end', () => {
     console.log(`[BOT] Disconnected`)
-    botStatus = 'disconnected'
     setTimeout(createBot, reconnectDelay)
   })
 }
@@ -355,8 +413,8 @@ function createBot() {
 async function startManualPoll() {
   if (manualPolling) return
   manualPolling = true
-  for (let i = 0; i < 40; i++) {
-    await new Promise(r => setTimeout(r, 1000))
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 500))
     const ans = await fetchManualAnswer()
     if (ans) {
       if (currentBot) currentBot.chat(ans)
@@ -368,4 +426,4 @@ async function startManualPoll() {
   manualPolling = false
 }
 
-console.log('═══ MINEFORT BOT — OCR v2 (multi-pass) ═══')
+console.log('═══ MINEFORT BOT — OCR v3 (position order) ═══')
