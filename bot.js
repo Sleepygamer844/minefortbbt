@@ -52,21 +52,25 @@ app.listen(PORT, '0.0.0.0', () => {
   setTimeout(createBot, 500)
 })
 
-async function sendDiscordText(message) {
-  if (!CONFIG.discordWebhook) return
-  try { await axios.post(CONFIG.discordWebhook, { content: String(message).substring(0, 1900) }) }
-  catch (err) { console.error('[DISCORD]', err.message) }
-}
-
 async function sendDiscordImage(imagePath, caption) {
   if (!CONFIG.discordWebhook) return
   try {
     const form = new FormData()
     form.append('content', caption || '')
-    form.append('file', fs.createReadStream(imagePath), { filename: path.basename(imagePath) })
-    await axios.post(CONFIG.discordWebhook, form, { headers: form.getHeaders() })
-    console.log('[DISCORD] Sent:', path.basename(imagePath))
-  } catch (err) { console.error('[DISCORD] Image failed:', err.message) }
+    form.append('file', fs.createReadStream(imagePath), { filename: 'captcha.png' })
+    await axios.post(CONFIG.discordWebhook, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      timeout: 5000
+    })
+    console.log('[DISCORD] Image sent')
+  } catch (err) { console.error('[DISCORD] Failed:', err.message) }
+}
+
+async function sendDiscordText(message) {
+  if (!CONFIG.discordWebhook) return
+  try { await axios.post(CONFIG.discordWebhook, { content: String(message).substring(0, 1900) }) }
+  catch (err) { console.error('[DISCORD]', err.message) }
 }
 
 async function fetchCaptchaAnswer() {
@@ -74,7 +78,7 @@ async function fetchCaptchaAnswer() {
   try {
     const res = await axios.get(
       `https://discord.com/api/v10/channels/${CONFIG.discordChannelId}/messages?limit=5`,
-      { headers: { Authorization: `Bot ${CONFIG.discordBotToken}` } }
+      { headers: { Authorization: `Bot ${CONFIG.discordBotToken}` }, timeout: 3000 }
     )
     for (const msg of res.data) {
       if (msg.content && msg.content.startsWith('!captcha ')) {
@@ -86,18 +90,16 @@ async function fetchCaptchaAnswer() {
         return ans
       }
     }
-  } catch (err) { console.error('[DISCORD]', err.message) }
+  } catch (err) { /* silent on poll errors */ }
   return null
 }
 
-// ─── STATE ───
 let currentBot = null
-let capturedMaps = {}      // mapId → file path
-let captchaSent = false
-let pollingActive = false
+let capturedMaps = {}
+let imageSent = false
+let pollActive = false
 let reconnectDelay = 30000
 
-// ─── FIND MAP ID FROM FRAME NBT ───
 function extractMapId(nbtData) {
   if (!nbtData) return null
   let val = nbtData.value !== undefined ? nbtData.value : nbtData
@@ -111,7 +113,6 @@ function extractMapId(nbtData) {
   return null
 }
 
-// ─── GET FRAMES WITH MAP IDs + POSITIONS ───
 function collectFrames(bot) {
   const frames = Object.values(bot.entities).filter(e => e && e.name && e.name.includes('item_frame'))
   const out = []
@@ -129,7 +130,6 @@ function collectFrames(bot) {
       if (mapId !== null && capturedMaps[mapId]) {
         out.push({
           id: mapId,
-          x: Math.floor(frame.position.x),
           y: Math.floor(frame.position.y),
           z: Math.floor(frame.position.z),
           file: capturedMaps[mapId]
@@ -140,25 +140,13 @@ function collectFrames(bot) {
   return out
 }
 
-// ─── STITCH USING WORLD COORDINATES ───
-// Frames sit on a wall at x = -3. Player is at x = 0 looking -X.
-//   Y=119 (top), Y=118 (mid), Y=117 (bottom)
-//   Z from player's left to right: +Z is LEFT, -Z is RIGHT (facing -X)
-// So reading order (top-left → bottom-right):
-//   Row 0: (Y=119, Z=1), (Y=119, Z=0), (Y=119, Z=-1)
-//   Row 1: (Y=118, Z=1), (Y=118, Z=0), (Y=118, Z=-1)
-//   Row 2: (Y=117, Z=1), (Y=117, Z=0), (Y=117, Z=-1)
 function stitchByWorldOrder(bot) {
   const frames = collectFrames(bot)
-  if (frames.length !== 9) {
-    console.log(`[STITCH] Only got ${frames.length}/9 frames`)
-    return null
-  }
+  if (frames.length !== 9) return null
 
-  // Sort: Y DESC (top row first), then Z DESC (leftmost first from player's POV)
   frames.sort((a, b) => {
-    if (a.y !== b.y) return b.y - a.y
-    return b.z - a.z
+    if (a.y !== b.y) return b.y - a.y  // top row first
+    return a.z - b.z                    // left→right
   })
 
   const TILE = 128
@@ -186,10 +174,9 @@ function stitchByWorldOrder(bot) {
   return out
 }
 
-// ─── CREATE BOT ───
 function createBot() {
-  captchaSent = false
-  pollingActive = false
+  imageSent = false
+  pollActive = false
   capturedMaps = {}
 
   console.log(`[BOT] Connecting... (delay ${reconnectDelay/1000}s)`)
@@ -221,7 +208,38 @@ function createBot() {
       const file = path.join(MAP_DIR, `map_${id}.png`)
       fs.writeFileSync(file, PNG.sync.write(png))
       capturedMaps[id] = file
-      console.log(`[MAP] Captured ${Object.keys(capturedMaps).length}/9`)
+      console.log(`[MAP] ${Object.keys(capturedMaps).length}/9`)
+
+      // ─── SEND IMAGE IMMEDIATELY WHEN 9 MAPS IN ───
+      if (Object.keys(capturedMaps).length === 9 && !imageSent) {
+        imageSent = true
+        console.log('[CAPTCHA] 9 maps ready — sending image NOW')
+
+        // Small delay so frames are all registered as entities
+        setTimeout(async () => {
+          const stitched = stitchByWorldOrder(bot)
+          if (stitched) {
+            await sendDiscordImage(
+              stitched,
+              '🔐 **CAPTCHA** — reply `!captcha <code>` **NOW**\n' +
+              'Read left→right, top→bottom'
+            )
+          } else {
+            // Frames not yet registered — retry once
+            setTimeout(async () => {
+              const retry = stitchByWorldOrder(bot)
+              if (retry) {
+                await sendDiscordImage(retry, '🔐 **CAPTCHA** — reply `!captcha <code>` **NOW**')
+              } else {
+                sendDiscordText('⚠️ Could not stitch — frames missing')
+              }
+            }, 800)
+          }
+        }, 300)
+
+        // START POLLING IMMEDIATELY
+        startFastPoll()
+      }
     } catch (e) { console.error('[MAP]', e.message) }
   }
 
@@ -234,32 +252,23 @@ function createBot() {
 
     if (/\/register/i.test(text)) bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`)
     else if (/\/login/i.test(text)) bot.chat(`/login ${CONFIG.password}`)
-    else if (/enter the captcha/i.test(text) && !captchaSent) {
-      captchaSent = true
-      console.log('[CAPTCHA] Prompt — sending image + starting fast poll')
-
-      // Start polling immediately at 500ms
-      startFastPolling()
-
-      // Send image after a tiny delay (let last maps arrive)
-      setTimeout(async () => {
-        const stitched = stitchByWorldOrder(bot)
-        if (stitched) {
-          await sendDiscordImage(
-            stitched,
-            '🔐 **CAPTCHA — read the letters left→right, top→bottom**\n' +
-            'Reply: `!captcha <code>`\n' +
-            '⚡ HURRY — only ~15 seconds!'
-          )
-        } else {
-          await sendDiscordText('⚠️ Maps not fully received')
-        }
-      }, 400)
+    else if (/enter the captcha/i.test(text)) {
+      console.log('[CAPTCHA] Prompt received')
+      // If poll not started (maps came late), start now
+      if (!pollActive) startFastPoll()
+      // If image not sent (unlikely), try now
+      if (!imageSent) {
+        imageSent = true
+        setTimeout(async () => {
+          const s = stitchByWorldOrder(bot)
+          if (s) await sendDiscordImage(s, '🔐 **CAPTCHA** — reply `!captcha <code>` **NOW**')
+        }, 200)
+      }
     }
   })
 
   bot.on('login', () => {
-    console.log(`[BOT] ✅ Logged in as ${bot.username}`)
+    console.log(`[BOT] ✅ Logged in`)
     reconnectDelay = 30000
     sendDiscordText(`✅ Bot **${bot.username}** connected`)
 
@@ -291,25 +300,25 @@ function createBot() {
   })
 }
 
-// ─── FAST POLL: 500ms ───
-async function startFastPolling() {
-  if (pollingActive) return
-  pollingActive = true
-  console.log('[CAPTCHA] Fast-poll active (500ms)')
+// ─── FAST POLL: 250ms (even faster) ───
+async function startFastPoll() {
+  if (pollActive) return
+  pollActive = true
+  console.log('[CAPTCHA] Fast-poll active (250ms)')
 
-  for (let i = 0; i < 60; i++) { // 30 seconds max
+  for (let i = 0; i < 80; i++) { // 20 seconds max
     const ans = await fetchCaptchaAnswer()
     if (ans) {
-      console.log(`[CAPTCHA] Got answer: ${ans}`)
+      console.log(`[CAPTCHA] Got: ${ans}`)
       if (currentBot) currentBot.chat(ans)
       sendDiscordText(`✅ Sent: **${ans}**`)
-      pollingActive = false
+      pollActive = false
       return
     }
-    await new Promise(r => setTimeout(r, 500))
+    await new Promise(r => setTimeout(r, 250))
   }
-  sendDiscordText('⏰ CAPTCHA poll timed out')
-  pollingActive = false
+  sendDiscordText('⏰ Poll timed out')
+  pollActive = false
 }
 
-console.log('═══ MINEFORT BOT — v5 (world-order stitch) ═══')
+console.log('═══ MINEFORT BOT — v7 (fast-send) ═══')
